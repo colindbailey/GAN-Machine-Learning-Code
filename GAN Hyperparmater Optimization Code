@@ -1,0 +1,343 @@
+```python
+# gan_impurity_experiments.py
+# -*- coding: utf-8 -*-
+"""
+Four strategies to drive your cWGAN-GP toward better low-level impurity predictions,
+plus a real-only baseline SMAPE on the blind test set.
+
+Usage:
+    1. Install dependencies: numpy, pandas, tensorflow, scikit-learn, optuna, seaborn (for visualization).
+    2. Place your training CSV and blind-test CSV at the paths specified below.
+    3. Run the script to perform hyperparameter search (Optuna strategy #1), train GANs, generate synthetic data,
+       and evaluate downstream ML performance via Random Forest and other models.
+    4. Review printed output for best hyperparameters and baseline SMAPE.
+    5. Uncomment strategies #2–#4 at the bottom to apply auxiliary loss, selective augmentation, or two-stage pipelines.
+"""
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neural_network import MLPRegressor
+import optuna
+
+# ------------------------------------------------------------------------------
+# 0) Utilities
+# ------------------------------------------------------------------------------
+def smape(y_true, y_pred, eps=1e-8):
+    """
+    Symmetric Mean Absolute Percentage Error.
+    Lower is better; returns percentage.
+    """
+    return 100.0 * np.mean(2 * np.abs(y_pred - y_true) /
+                           (np.abs(y_true) + np.abs(y_pred) + eps))
+
+def build_cwgan(latent_dim, data_dim):
+    """
+    Construct and return a simple cWGAN-GP generator (G) and critic (C).
+    - latent_dim: dimension of the noise input
+    - data_dim: dimension of the real data vectors (features + targets)
+    """
+    G = tf.keras.Sequential([
+        layers.Input(shape=(latent_dim,)),
+        layers.Dense(128, activation="relu"),
+        layers.Dense(256, activation="relu"),
+        layers.Dense(data_dim, activation="sigmoid"),  # output normalized to [0,1]
+    ], name="Generator")
+
+    C = tf.keras.Sequential([
+        layers.Input(shape=(data_dim,)),
+        layers.Dense(256, activation="relu"),
+        layers.Dense(128, activation="relu"),
+        layers.Dense(1),  # critic output
+    ], name="Critic")
+
+    return G, C
+
+def gradient_penalty(C, real, fake):
+    """
+    WGAN-GP gradient penalty: ensures Lipschitz continuity.
+    - real, fake: batches of real and generated samples
+    """
+    eps = tf.random.uniform([real.shape[0],1], 0.0, 1.0)
+    mid = eps * real + (1 - eps) * fake
+    with tf.GradientTape() as t:
+        t.watch(mid)
+        pred = C(mid, training=True)
+    grad = t.gradient(pred, mid)
+    slope = tf.sqrt(tf.reduce_sum(tf.square(grad), axis=1))
+    return tf.reduce_mean((slope - 1.0)**2)
+
+# ------------------------------------------------------------------------------
+# 1) Load & prepare data
+# ------------------------------------------------------------------------------
+# Replace with your actual file paths
+df_train = pd.read_csv("C:/Users/baileycd2/Downloads/Kinetic Experiments (21).csv").fillna(0)
+df_blind = pd.read_csv("C:/Users/baileycd2/Downloads/Kinetic_Experiments_BlindTest.csv").fillna(0)
+
+# Rename shorthand columns to meaningful compound names
+rename = dict(zip(
+    ["F","A","B","C","D","E","H","I","J"],
+    ["DIPBA","HBA","Sulfonate","Mono","Isopropoxy",
+     "Hydroxybenzoate","Esterified","Tri","Pseudo"]
+))
+for df in (df_train, df_blind):
+    df.rename(columns=rename, inplace=True)
+    # Create an initial concentration column if missing
+    df["Initial_HBA_Conc"] = df.get("HBA_Conc", df["HBA"])
+
+# Define feature and target columns
+x_cols   = ["Temp","H2SO4","Initial_HBA_Conc","time"]
+y_cols   = ["DIPBA","HBA","Sulfonate","Mono","Isopropoxy",
+            "Hydroxybenzoate","Esterified","Tri","Pseudo"]
+imp_cols = y_cols  # impurities of interest change this to include any impruities of interest you want optimized for
+
+# Prepare blind hold-out set (first 5 samples)
+true_b = df_blind.iloc[:5].reset_index(drop=True)
+Xb, yb = true_b[x_cols].values, true_b[y_cols].values
+
+# Prepare real training DataFrame
+df_real = df_train[x_cols + y_cols + ["experiment"]].copy()
+
+# Scale data for GAN training
+data_gan    = df_real[x_cols + y_cols].astype(np.float32)
+scaler      = MinMaxScaler().fit(data_gan.values)
+real_scaled = scaler.transform(data_gan.values)
+n_samples, data_dim = real_scaled.shape
+
+# ------------------------------------------------------------------------------
+# 2) STRATEGY #1: Optuna search on impurity‐SMAPE objective
+# ------------------------------------------------------------------------------
+def objective_imp_smape(trial):
+    # Define search space for GAN hyperparameters
+    latent_dim   = trial.suggest_int("latent_dim",  50, 1000)
+    epochs       = trial.suggest_int("epochs",     200,3000, step=100)
+    critic_iters = trial.suggest_int("crit_iters", 1,   5)
+    gp_w         = trial.suggest_float("gp_w",     1e-1,10.0, log=True)
+
+    # Build models
+    G, C = build_cwgan(latent_dim, data_dim)
+    g_opt = tf.keras.optimizers.Adam(1e-4, beta_1=0.0, beta_2=0.9)
+    c_opt = tf.keras.optimizers.Adam(1e-4, beta_1=0.0, beta_2=0.9)
+
+    @tf.function
+    def d_step(real):
+        # Critic update
+        noise = tf.random.normal([tf.shape(real)[0], latent_dim])
+        with tf.GradientTape() as t:
+            fake  = G(noise, training=True)
+            loss  = tf.reduce_mean(C(fake)) - tf.reduce_mean(C(real))
+            gp    = gradient_penalty(C, real, fake)
+            total = loss + gp_w * gp
+        grads = t.gradient(total, C.trainable_variables)
+        c_opt.apply_gradients(zip(grads, C.trainable_variables))
+
+    @tf.function
+    def g_step():
+        # Generator update
+        noise = tf.random.normal([batch_size, latent_dim])
+        with tf.GradientTape() as t:
+            fake = G(noise, training=True)
+            loss = -tf.reduce_mean(C(fake))
+        grads = t.gradient(loss, G.trainable_variables)
+        g_opt.apply_gradients(zip(grads, G.trainable_variables))
+
+    # Training loop
+    ds = tf.data.Dataset.from_tensor_slices(real_scaled).shuffle(5000).batch(batch_size)
+    for _ in range(epochs):
+        for real in ds:
+            for __ in range(critic_iters):
+                d_step(real)
+            g_step()
+
+    # Generate synthetic samples
+    noise1     = tf.random.normal([n_samples, latent_dim])
+    syn_scaled = G(noise1, training=False).numpy().clip(0,1)
+    df_syn1    = pd.DataFrame(scaler.inverse_transform(syn_scaled),
+                              columns=x_cols + y_cols)
+
+    # Downstream: train RF on real+synthetic, evaluate only impurities on blind set
+    df_aug = pd.concat([df_real, df_syn1.assign(experiment=-1)], ignore_index=True)
+    X_aug, y_aug = df_aug[x_cols].values, df_aug[y_cols].values
+    rf = MultiOutputRegressor(RandomForestRegressor(n_estimators=100, random_state=0))
+    rf.fit(X_aug, y_aug)
+    yp = rf.predict(Xb)
+    idx = [y_cols.index(c) for c in imp_cols]
+    return float(smape(yb[:, idx], yp[:, idx]))
+
+# ------------------------------------------------------------------------------
+# 3) STRATEGY #2: cWGAN-GP with auxiliary impurity loss
+# ------------------------------------------------------------------------------
+def train_with_auxiliary(lambda_imp=1.0, latent_dim=100, epochs=500, crit_iters=3):
+    """
+    Train cWGAN-GP adding an auxiliary SMAPE loss on impurity predictions.
+    Returns trained generator G.
+    """
+    G, C = build_cwgan(latent_dim, data_dim)
+    g_opt = tf.keras.optimizers.Adam(1e-4,0.0,0.9)
+    c_opt = tf.keras.optimizers.Adam(1e-4,0.0,0.9)
+
+    # Train a frozen RF to predict impurities from features
+    impur_rf = MultiOutputRegressor(RandomForestRegressor(n_estimators=100))
+    impur_rf.fit(df_real[x_cols].values, df_real[imp_cols].values)
+
+    @tf.function
+    def d_step(real):
+        # Critic update
+        noise = tf.random.normal([tf.shape(real)[0], latent_dim])
+        fake  = G(noise, training=True)
+        loss  = tf.reduce_mean(C(fake)) - tf.reduce_mean(C(real))
+        gp    = gradient_penalty(C, real, fake)
+        total = loss + 10.0 * gp
+        grads = tf.GradientTape().gradient(total, C.trainable_variables)
+        c_opt.apply_gradients(zip(grads, C.trainable_variables))
+
+    def g_step(real_np, real_tf):
+        # Generator update with auxiliary SMAPE penalty
+        noise    = tf.random.normal([tf.shape(real_tf)[0], latent_dim])
+        fake     = G(noise, training=True)
+        wgan_loss= -tf.reduce_mean(C(fake))
+
+        # Compute auxiliary loss on impurities
+        X_batch  = real_np[:, :len(x_cols)]
+        imp_real = real_np[:, -len(imp_cols):]
+        imp_fake = impur_rf.predict(X_batch)
+        aux      = smape(imp_real, imp_fake)
+
+        total = wgan_loss + lambda_imp * aux
+        grads = tf.GradientTape().gradient(total, G.trainable_variables)
+        g_opt.apply_gradients(zip(grads, G.trainable_variables))
+
+    # Training loop
+    ds = tf.data.Dataset.from_tensor_slices(real_scaled).shuffle(5000).batch(batch_size)
+    for _ in range(epochs):
+        for real_tf in ds:
+            real_np = real_tf.numpy()
+            for _ in range(crit_iters):
+                d_step(real_tf)
+            g_step(real_np, real_tf)
+
+    return G
+
+# ------------------------------------------------------------------------------
+# 4) STRATEGY #3: Selective augmentation
+# ------------------------------------------------------------------------------
+def selective_augmentation(G, latent_dim, synth_factor=5):
+    """
+    Generate synthetic points only for samples with low impurity levels by:
+      1) Selecting rows where mean impurity < 20th percentile.
+      2) Replicating them synth_factor times.
+      3) Concatenating real + synthetic data.
+    """
+    X = df_real[x_cols].values
+    y = df_real[imp_cols].values
+    mask = (y.mean(axis=1) < np.percentile(y.mean(axis=1), 20))
+    X_sel = X[mask]
+
+    noise = tf.random.normal([len(X_sel)*synth_factor, latent_dim])
+    syn   = G(noise, training=False).numpy().clip(0,1)
+
+    full_inv = scaler.inverse_transform(
+        np.hstack([np.repeat(X_sel, synth_factor, axis=0),
+                   syn[:, len(x_cols):]])
+    )
+    df_syn = pd.DataFrame(full_inv, columns=x_cols+y_cols)
+    df_syn["experiment"] = np.tile(df_real["experiment"].values[mask], synth_factor)
+    return pd.concat([df_real, df_syn], ignore_index=True)
+
+# ------------------------------------------------------------------------------
+# 5) STRATEGY #4: Two-stage pipeline
+# ------------------------------------------------------------------------------
+def two_stage_pipeline(G, latent_dim):
+    """
+    1) Train MLP to predict major compounds from real data.
+    2) Generate synthetic full dataset: majors via MLP, impurities via G.
+    3) Concatenate real + synthetic.
+    """
+    majors  = [c for c in y_cols if c not in imp_cols]
+    m_model = MultiOutputRegressor(MLPRegressor(max_iter=2000))
+    m_model.fit(df_real[x_cols].values, df_real[majors].values)
+
+    noise      = tf.random.normal([n_samples, latent_dim])
+    syn_scaled = G(noise, training=False).numpy().clip(0,1)
+    data_inv   = scaler.inverse_transform(syn_scaled)
+    X_synth    = data_inv[:, :len(x_cols)]
+    imp_synth  = data_inv[:, len(x_cols):]
+
+    maj_pred = m_model.predict(X_synth)
+    df_syn   = pd.DataFrame(
+        np.hstack([X_synth, maj_pred, imp_synth]),
+        columns=x_cols + majors + imp_cols
+    )
+    df_syn["experiment"] = df_real["experiment"].values
+    return pd.concat([df_real, df_syn], ignore_index=True)
+
+# ------------------------------------------------------------------------------
+# 6) Downstream evaluation helper
+# ------------------------------------------------------------------------------
+def downstream_eval(df_aug):
+    """
+    Train a new RF on augmented data (df_aug),
+    predict on blind set, and print impurity SMAPE.
+    """
+    X_aug, y_aug = df_aug[x_cols].values, df_aug[y_cols].values
+    rf = MultiOutputRegressor(RandomForestRegressor(n_estimators=200))
+    rf.fit(X_aug, y_aug)
+    yp = rf.predict(Xb)
+    idx = [y_cols.index(c) for c in imp_cols]
+    print("→ Impurity SMAPE:", smape(yb[:,idx], yp[:,idx]))
+
+# ------------------------------------------------------------------------------
+# 7) Main: run strategy #1 and baseline
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    # Define batch size for GAN training
+    batch_size = 32
+
+    # Strategy #1: Optuna hyperparameter optimization
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective_imp_smape, n_trials=50)
+    best = study.best_params
+    print("Best params (impurity SMAPE):", best)
+
+    # Build final GAN with best params
+    G1, _ = build_cwgan(best["latent_dim"], data_dim)
+
+    # Generate synthetic data and evaluate strategy #1
+    noise1  = tf.random.normal([n_samples, best["latent_dim"]])
+    syn1    = G1(noise1, training=False).numpy().clip(0,1)
+    df_syn1 = pd.DataFrame(scaler.inverse_transform(syn1),
+                           columns=x_cols+y_cols)
+    df_aug1 = pd.concat([df_real, df_syn1.assign(experiment=-1)],
+                        ignore_index=True)
+    downstream_eval(df_aug1)
+
+    # Baseline: real-only RF on blind test set
+    rf_base = MultiOutputRegressor(RandomForestRegressor(n_estimators=200, random_state=42))
+    rf_base.fit(df_real[x_cols].values, df_real[y_cols].values)
+    yb_pred = rf_base.predict(Xb)
+    print(f"\nBaseline (real-only) SMAPE on blind set: {smape(yb, yb_pred):.2f}%")
+
+    # To run strategies #2–#4, uncomment below examples:
+    # G2 = train_with_auxiliary(lambda_imp=5.0,
+    #                           latent_dim=best["latent_dim"], epochs=500)
+    # downstream_eval(pd.concat([df_real,
+    #                             pd.DataFrame(
+    #                                 scaler.inverse_transform(
+    #                                     G2(tf.random.normal([n_samples, best["latent_dim"]]),
+    #                                       training=False
+    #                                     ).numpy().clip(0,1)
+    #                                 ),
+    #                                 columns=x_cols+y_cols
+    #                             ).assign(experiment=-1)],
+    #                           ignore_index=True))
+
+    # df_aug3 = selective_augmentation(G1, best["latent_dim"], synth_factor=5)
+    # downstream_eval(df_aug3)
+
+    # df_aug4 = two_stage_pipeline(G1, best["latent_dim"])
+    # downstream_eval(df_aug4)
