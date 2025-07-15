@@ -1,0 +1,90 @@
+# rf_per_compound_analysis.py
+# -*- coding: utf-8 -*-
+"""
+Train cWGAN-GP on real data, generate synthetic samples,
+then fit a Bayesian‐tuned Random Forest to:
+
+  • Real only  
+  • Real + Synth (shared-ID)  
+  • Real + Synth (separate-ID)  
+
+Finally, report SMAPE, NRMSE & R² for each impurity (per compound)
+on the 5 true-blind samples to reveal any outliers.
+
+Usage (no code changes required):
+  1. Install dependencies:
+       pip install numpy pandas tensorflow scikit-learn scikit-optimize
+  2. Set the correct paths for the two CSV input files below.
+  3. Run the script:
+       python rf_per_compound_analysis.py
+  4. Inspect printed per-compound metrics for each dataset variant.
+"""
+
+import os, random
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers
+from sklearn.preprocessing   import MinMaxScaler, RobustScaler
+from sklearn.pipeline         import make_pipeline
+from sklearn.metrics          import mean_squared_error, r2_score, make_scorer
+from sklearn.model_selection  import GroupKFold
+from sklearn.multioutput      import MultiOutputRegressor
+from skopt                    import BayesSearchCV
+from skopt.space              import Integer, Real
+from sklearn.ensemble         import RandomForestRegressor
+import warnings
+
+# ─── Silence warnings ──────────────────────────────────────────────────────────
+warnings.filterwarnings("ignore")
+
+# ─── 0) Reproducibility ───────────────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+os.environ["PYTHONHASHSEED"] = str(SEED)
+
+# ─── 1) Load & prep data ──────────────────────────────────────────────────────
+# Update these paths to your local CSV files
+train_df = pd.read_csv("C:/Users/baileycd2/Downloads/Kinetic Experiments (21).csv").fillna(0)
+blind_df = pd.read_csv("C:/Users/baileycd2/Downloads/Kinetic_Experiments_BlindTest.csv").fillna(0)
+
+# Rename shorthand columns F–J to full compound names
+rename = dict(zip(
+    ["F","A","B","C","D","E","H","I","J"],
+    ["DIPBA","HBA","Sulfonate","Mono","Isopropoxy",
+     "Hydroxybenzoate","Esterified","Tri","Pseudo"]
+))
+for df in (train_df, blind_df):
+    df.rename(columns=rename, inplace=True)
+    # Ensure we have an initial concentration column
+    df["Initial_HBA_Conc"] = df.get("HBA_Conc", df["HBA"])
+
+# Define feature columns and target (compound) columns
+x_cols = ["Temp","H2SO4","Initial_HBA_Conc","time"]
+y_cols = ["DIPBA","HBA","Sulfonate","Mono","Isopropoxy",
+          "Hydroxybenzoate","Esterified","Tri","Pseudo"]
+
+# Extract the first 5 blind samples for final evaluation
+true_b = blind_df.iloc[:5].reset_index(drop=True)
+Xb, yb = true_b[x_cols].values, true_b[y_cols].values
+
+# Prepare the real training frame (including experiment IDs)
+df_real = train_df[x_cols + y_cols + ["experiment"]].reset_index(drop=True)
+
+# ─── 2) Train tuned cWGAN-GP on real data ────────────────────────────────────
+latent_dim   = 483
+epochs       = 2300
+critic_iters = 1
+gp_weight    = 1.7547691624018331
+batch_size   = 64
+synth_factor = 10  # generate 10× synthetic
+
+print('Latent Dim =', latent_dim)
+
+# Scale data for GAN
+data_gan    = df_real[x_cols + y_cols].astype(np.float32).values
+scaler      = MinMaxScaler().fit(data_gan)
+real_scaled = scaler.transform(data_gan)
+n_r_
