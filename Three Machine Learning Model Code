@@ -1,0 +1,275 @@
+# reproducible_cwgan_rf_xgb_ann.py
+# -*- coding: utf-8 -*-
+"""
+1) Train cWGAN-GP (impurity-tuned) on your reaction data
+2) Generate 1× synthetic samples, assign experiments IDs (shared vs separate)
+3) Perform Bayesian hyperparameter search over XGBoost, RF & ANN on:
+     - Real only
+     - Real + Synthetic (shared IDs)
+     - Real + Synthetic (separate IDs)
+4) Evaluate each model on the 5 true-blind samples using SMAPE, NRMSE & R²
+   All random seeds are fixed for full reproducibility.
+"""
+
+import os, random
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers
+from sklearn.preprocessing    import MinMaxScaler, RobustScaler
+from sklearn.pipeline         import make_pipeline
+from sklearn.metrics          import mean_squared_error, r2_score, make_scorer
+from sklearn.model_selection  import GroupKFold
+from sklearn.multioutput      import MultiOutputRegressor
+from skopt                    import BayesSearchCV
+from skopt.space              import Integer, Real
+import xgboost as xgb
+from sklearn.ensemble         import RandomForestRegressor
+from sklearn.neural_network   import MLPRegressor
+import warnings
+
+# Silence warnings to keep output clean
+warnings.filterwarnings("ignore")
+
+# ----------------------------------------------------------------------------
+# 0) Seeds & Determinism
+# ----------------------------------------------------------------------------
+SEED = 42
+random.seed(SEED)                # Python random seed
+np.random.seed(SEED)             # NumPy random seed
+tf.random.set_seed(SEED)         # TensorFlow random seed
+os.environ["PYTHONHASHSEED"] = str(SEED)   # Hash seed
+
+# ----------------------------------------------------------------------------
+# 1) Load & Prepare Real + Blind Data
+# ----------------------------------------------------------------------------
+# Load training and blind-test CSVs, fill missing values
+train_df = pd.read_csv("C:/Users/.../Kinetic Experiments (21).csv").fillna(0)
+blind_df = pd.read_csv("C:/Users/.../Kinetic_Experiments_BlindTest.csv").fillna(0)
+
+# Rename shorthand columns F–J to meaningful compound names
+rename = dict(zip(
+    ["F","A","B","C","D","E","H","I","J"],
+    ["DIPBA","HBA","Sulfonate","Mono","Isopropoxy",
+     "Hydroxybenzoate","Esterified","Tri","Pseudo"]
+))
+for df in (train_df, blind_df):
+    df.rename(columns=rename, inplace=True)
+    # Ensure initial HBA concentration column exists
+    df["Initial_HBA_Conc"] = df.get("HBA_Conc", df["HBA"])
+
+# Feature columns and target columns
+x_cols = ["Temp","H2SO4","Initial_HBA_Conc","time"]
+y_cols = ["DIPBA","HBA","Sulfonate","Mono","Isopropoxy",
+          "Hydroxybenzoate","Esterified","Tri","Pseudo"]
+
+# Extract the first 5 blind samples for final evaluation
+true_b = blind_df.iloc[:5].reset_index(drop=True)
+Xb, yb = true_b[x_cols].values, true_b[y_cols].values
+
+# Prepare the real training DataFrame
+df_real = train_df[x_cols + y_cols + ["experiment"]].reset_index(drop=True)
+
+# ----------------------------------------------------------------------------
+# 2) Train tuned cWGAN-GP on Real Data
+# ----------------------------------------------------------------------------
+latent_dim   = 511                 # from prior Optuna search
+epochs       = 1100
+critic_iters = 2
+gp_weight    = 0.26547048272821105
+batch_size   = 64
+synth_factor = 1                   # generate same number of synthetic samples
+
+print("Latent Dim =", latent_dim)
+
+# Scale real data into [0,1] for GAN training
+data_gan    = df_real[x_cols + y_cols].astype(np.float32).values
+scaler      = MinMaxScaler().fit(data_gan)
+real_scaled = scaler.transform(data_gan)
+n_real, data_dim = real_scaled.shape
+
+def build_cwgan(latent_dim, data_dim):
+    """Return Generator G and Critic C architectures."""
+    G = tf.keras.Sequential([
+        layers.Input((latent_dim,)),
+        layers.Dense(128, activation="relu"),
+        layers.Dense(256, activation="relu"),
+        layers.Dense(data_dim, activation="sigmoid")
+    ], name="Generator")
+    C = tf.keras.Sequential([
+        layers.Input((data_dim,)),
+        layers.Dense(256, activation="relu"),
+        layers.Dense(128, activation="relu"),
+        layers.Dense(1)
+    ], name="Critic")
+    return G, C
+
+def gradient_penalty(C, real, fake):
+    """Compute WGAN-GP gradient penalty term."""
+    eps  = tf.random.uniform([real.shape[0],1], 0, 1, seed=SEED)
+    mid  = eps*real + (1-eps)*fake
+    with tf.GradientTape() as tape:
+        tape.watch(mid)
+        p = C(mid, training=True)
+    grad  = tape.gradient(p, mid)
+    slope = tf.sqrt(tf.reduce_sum(tf.square(grad), axis=1))
+    return tf.reduce_mean((slope - 1.0)**2)
+
+# Build and compile GAN models
+G, C = build_cwgan(latent_dim, data_dim)
+g_opt = tf.keras.optimizers.Adam(1e-4, beta_1=0.0, beta_2=0.9)
+c_opt = tf.keras.optimizers.Adam(1e-4, beta_1=0.0, beta_2=0.9)
+
+@tf.function
+def d_step(real_batch):
+    """Critic update step in WGAN-GP."""
+    noise = tf.random.normal([tf.shape(real_batch)[0], latent_dim], seed=SEED)
+    with tf.GradientTape() as tape:
+        fake  = G(noise, training=True)
+        loss  = tf.reduce_mean(C(fake)) - tf.reduce_mean(C(real_batch))
+        gp    = gradient_penalty(C, real_batch, fake)
+        total = loss + gp_weight * gp
+    grads = tape.gradient(total, C.trainable_variables)
+    c_opt.apply_gradients(zip(grads, C.trainable_variables))
+
+@tf.function
+def g_step():
+    """Generator update step in WGAN-GP."""
+    noise = tf.random.normal([batch_size, latent_dim], seed=SEED)
+    with tf.GradientTape() as tape:
+        fake = G(noise, training=True)
+        loss = -tf.reduce_mean(C(fake))
+    grads = tape.gradient(loss, G.trainable_variables)
+    g_opt.apply_gradients(zip(grads, G.trainable_variables))
+
+# Training loop
+ds = tf.data.Dataset.from_tensor_slices(real_scaled) \
+                   .shuffle(5000, seed=SEED) \
+                   .batch(batch_size, drop_remainder=True)
+for ep in range(epochs):
+    for real_batch in ds:
+        for _ in range(critic_iters):
+            d_step(real_batch)
+        g_step()
+    if ep % 200 == 0:
+        tf.print("cWGAN-GP epoch", ep)
+
+# Generate synthetic samples
+n_synth = n_real * synth_factor
+noise   = tf.random.normal([n_synth, latent_dim], seed=SEED)
+syn_scaled = G(noise, training=False).numpy().clip(0,1)
+df_syn = pd.DataFrame(
+    scaler.inverse_transform(syn_scaled),
+    columns = x_cols + y_cols
+)
+
+# ----------------------------------------------------------------------------
+# 3) ML Pipelines & Hyperparameter Spaces
+# ----------------------------------------------------------------------------
+def smape(true, pred, eps=1e-8):
+    """Re-definition for downstream scoring."""
+    return 100.*np.mean(2*np.abs(pred-true)/(np.abs(true)+np.abs(pred)+eps))
+
+# Create a scorer for BayesSearchCV (maximize negative SMAPE == minimize SMAPE)
+smape_scorer = make_scorer(lambda t,p: -smape(t,p), greater_is_better=True)
+
+# Define pipelines for XGBoost, RF, and ANN
+pipes = {
+    "XGBoost": make_pipeline(
+        RobustScaler(),
+        MultiOutputRegressor(
+            xgb.XGBRegressor(objective="reg:squarederror",
+                             random_state=SEED, verbosity=0, n_jobs=1),
+            n_jobs=1
+        )
+    ),
+    "RandomForest": make_pipeline(
+        RobustScaler(),
+        MultiOutputRegressor(
+            RandomForestRegressor(random_state=SEED, n_jobs=1),
+            n_jobs=1
+        )
+    ),
+    "ANN": make_pipeline(
+        RobustScaler(),
+        MultiOutputRegressor(
+            MLPRegressor(hidden_layer_sizes=(100,),
+                         max_iter=3000,
+                         random_state=SEED),
+            n_jobs=1
+        )
+    ),
+}
+
+# Hyperparameter search spaces for each algorithm
+param_spaces = {
+    "XGBoost": {
+        "multioutputregressor__estimator__n_estimators":  Integer(100,500),
+        "multioutputregressor__estimator__max_depth":     Integer(3,15),
+        "multioutputregressor__estimator__learning_rate": Real(1e-3,0.3, prior="log-uniform"),
+        "multioutputregressor__estimator__subsample":     Real(0.5,1.0),
+    },
+    "RandomForest": {
+        "multioutputregressor__estimator__n_estimators":    Integer(100,500),
+        "multioutputregressor__estimator__max_depth":       Integer(5,20),
+        "multioutputregressor__estimator__min_samples_leaf":Integer(1,5),
+    },
+    "ANN": {
+        "multioutputregressor__estimator__alpha":             Real(1e-5,1e-2, prior="log-uniform"),
+        "multioutputregressor__estimator__learning_rate_init":Real(1e-4,1e-1, prior="log-uniform"),
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4) Run BayesSearchCV + Blind Evaluation
+# ----------------------------------------------------------------------------
+gkf = GroupKFold(n_splits=20)
+datasets = {}
+
+# A) Real only dataset
+datasets["REAL_ONLY"] = df_real.copy()
+
+# B) Real + synthetic with shared experiment IDs
+df_s = df_syn.copy()
+df_s["experiment"] = np.tile(
+    df_real["experiment"].astype(int).values,
+    synth_factor
+)
+datasets["REAL_SYNTH_SHARED"] = pd.concat([df_real, df_s], ignore_index=True)
+
+# C) Real + synthetic with separate experiment IDs
+df_s2 = df_syn.copy()
+start = df_real["experiment"].astype(int).max() + 1
+df_s2["experiment"] = np.arange(start, start + len(df_s2))
+datasets["REAL_SYNTH_SEPARATE"] = pd.concat([df_real, df_s2], ignore_index=True)
+
+# Loop through each dataset & model, optimize, and evaluate on blind set
+for name_ds, df_ds in datasets.items():
+    X_all = df_ds[x_cols].values
+    y_all = df_ds[y_cols].values
+    grp   = df_ds["experiment"].values
+
+    print(f"\n=== DATASET: {name_ds} (n={len(df_ds)}) ===")
+    for model_name, pipe in pipes.items():
+        opt = BayesSearchCV(
+            pipe, param_spaces[model_name],
+            scoring      = smape_scorer,
+            cv           = gkf,
+            n_iter       = 30,
+            random_state = SEED,
+            n_jobs        = 1
+        )
+        # Fit on training data (with groups) and tune hyperparam
+        opt.fit(X_all, y_all, groups=grp)
+
+        # Extract CV and blind-set metrics
+        cv_sm  = -opt.best_score_                                 # CV SMAPE
+        yp_b   = opt.predict(Xb).clip(0, None)                     # predictions
+        b_sm   = smape(yb, yp_b)                                   # blind SMAPE
+        rmse   = np.sqrt(mean_squared_error(yb, yp_b))            # RMSE
+        nrmse  = rmse / (yb.max(axis=0) - yb.min(axis=0)).mean()   # normalized RMSE
+        r2m    = np.mean([r2_score(yb[:,i], yp_b[:,i]) 
+                           for i in range(yp_b.shape[1])])       # mean R²
+
+        print(f"{model_name:12s} CV-SMAPE={cv_sm:5.2f}% | "
+              f"Blind SMAPE={b_sm:5.2f}% | NRMSE={nrmse:.3f} | R²={r2m:.3f}")
